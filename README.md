@@ -4,7 +4,7 @@
 
 ## What It Does
 
-Monitors ERC-20 token transfers from whale wallets (exchanges, funds, large holders) in real-time. Fetches live prices from CoinGecko API and sends alerts only for known valuable tokens - no false alerts from worthless meme coins.
+Monitors ERC-20 token transfers from whale wallets (exchanges, funds, large holders) in real-time. Fetches live prices from CoinGecko API and sends alerts only for known valuable tokens.
 
 ## Quick Start
 
@@ -125,7 +125,6 @@ watchtower/
 ├── .env             # Your configuration (git-ignored)
 ├── run.sh           # Start script
 ├── README.md        # This file
-└── CLAUDE.md        # Developer guide
 ```
 
 ## How It Works
