@@ -1,0 +1,28 @@
+# Rust
+/target/
+**/*.rs.bk
+Cargo.lock
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment
+.env
+config.toml
+
+# Logs
+*.log
+
+# Lambda
+bootstrap
+lambda-*.zip
+
+# Docker
+.dockerignore
