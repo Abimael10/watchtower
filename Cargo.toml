@@ -4,3 +4,38 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+# Async runtime - only what we need
+tokio = { version = "1.0", default-features = false, features = ["macros", "rt-multi-thread", "net", "time"] }
+
+# Serialization
+serde = { version = "1.0", default-features = false, features = ["derive"] }
+serde_json = { version = "1.0", default-features = false, features = ["std"] }
+
+# HTTP client - minimal features
+reqwest = { version = "0.11", default-features = false, features = ["json", "rustls-tls"] }
+
+# Error handling
+anyhow = { version = "1.0", default-features = false, features = ["std"] }
+
+# Logging
+tracing = { version = "0.1", default-features = false, features = ["std"] }
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "ansi"] }
+
+# Date/time - minimal
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+
+# Blockchain connectivity - use specific crates, not umbrella
+ethers-core = { version = "2.0", default-features = false }
+ethers-providers = { version = "2.0", default-features = false, features = ["ws", "rustls"] }
+
+# Environment variables
+dotenv = { version = "0.15", default-features = false }
+
+# Hex encoding
+hex = { version = "0.4", default-features = false, features = ["std"] }
+
+[profile.release]
+opt-level = "z"     # Optimize for size
+lto = true          # Link-time optimization
+codegen-units = 1   # Better optimization
+strip = true        # Strip symbols

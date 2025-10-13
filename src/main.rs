@@ -1,579 +1,394 @@
-/*
- * WATCHTOWER - Your Crypto Alert System
- * 
- * Think of this as a security guard for your crypto investments.
- * It watches the blockchain and alerts you when important things happen.
- * 
- * This file contains the entire program - everything needed to:
- * 1. Watch for important blockchain events
- * 2. Check if they're dangerous using simple rules  
- * 3. Send you clear, understandable alerts
- */
+// Watchtower - Whale Wallet Monitor
+// Monitors ERC-20 token transfers from specified whale wallets and sends Telegram alerts
 
-// These are tools we need (like importing libraries in other languages)
-use anyhow::Result;                    // For handling errors gracefully
-use chrono::{DateTime, Utc};          // For timestamps (when things happened)
-use serde::{Deserialize, Serialize};  // For converting data to/from text
-use std::env;                         // For reading settings from environment
-use tokio::time::{sleep, Duration};   // For waiting between events
-use tracing::{info, warn};            // For logging what's happening
+use anyhow::Result;
+use chrono::{DateTime, Utc};
+use ethers_core::types::{Address, Filter, H256, U256};
+use ethers_providers::{Middleware, Provider, StreamExt, Ws};
+use std::env;
+use tracing::{info, warn};
 
-/*
- * PART 1: DEFINING WHAT WE WATCH FOR
- * 
- * These are the types of events that happen on the blockchain
- * that we care about. Think of them like different types of 
- * security alerts a guard might report.
- */
+// ============================================================================
+// Core Data Models
+// ============================================================================
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum Event {
-    // When someone's collateral (backup money) changes
-    VaultUpdate {
-        vault_id: String,        // Which vault (like an account number)
-        collateral: f64,         // How much backup money they have
-        debt: f64,              // How much they borrowed
-        ratio: f64,             // collateral ÷ debt (safety ratio)
-        block_number: u64,      // When this happened (block number)
-        timestamp: DateTime<Utc>, // Exact time this happened
-    },
-    
-    // When someone moves money from one place to another
-    Transfer {
-        from: String,           // Who sent the money
-        to: String,             // Who received the money
-        amount: f64,            // How much money was moved
-        token: String,          // What type of money (DAI, USDC, etc.)
-        block_number: u64,      // When this happened
-        timestamp: DateTime<Utc>, // Exact time
-    },
-    
-    // When someone loses their collateral (gets liquidated)
-    Liquidation {
-        vault_id: String,       // Which vault got liquidated
-        liquidated_amount: f64, // How much money was lost
-        block_number: u64,      // When this happened
-        timestamp: DateTime<Utc>, // Exact time
-    },
+#[derive(Debug, Clone)]
+pub struct Transfer {
+    pub from: String,
+    pub to: String,
+    pub amount: f64,
+    pub token: String,
+    pub block_number: u64,
+    pub timestamp: DateTime<Utc>,
 }
-
-/*
- * PART 2: DEFINING ALERTS
- * 
- * When we detect something important, we create an alert.
- * Think of these like different types of alarms.
- */
 
 #[derive(Debug, Clone)]
 pub struct Alert {
-    pub title: String,          // Short description (like "Low Collateral")
-    pub message: String,        // Detailed explanation
-    pub severity: Severity,     // How urgent this is
-    pub timestamp: DateTime<Utc>, // When we created this alert
+    pub title: String,
+    pub message: String,
+    pub timestamp: DateTime<Utc>,
 }
 
-// How urgent an alert is (like alarm levels)
-#[derive(Debug, Clone)]
-pub enum Severity {
-    Info,       // ℹ️ Just so you know (blue)
-    Warning,    // ⚠️ Pay attention (yellow)  
-    Critical,   // 🚨 Urgent! (red)
-}
-
-// Helper functions to create different types of alerts
 impl Alert {
-    // Create a critical (urgent) alert
-    pub fn critical(title: String, message: String) -> Self {
+    pub fn new(title: String, message: String) -> Self {
         Self {
             title,
             message,
-            severity: Severity::Critical,
-            timestamp: Utc::now(),
-        }
-    }
-
-    // Create a warning alert
-    pub fn warning(title: String, message: String) -> Self {
-        Self {
-            title,
-            message,
-            severity: Severity::Warning,
-            timestamp: Utc::now(),
-        }
-    }
-
-    // Create an info alert
-    pub fn info(title: String, message: String) -> Self {
-        Self {
-            title,
-            message,
-            severity: Severity::Info,
             timestamp: Utc::now(),
         }
     }
 }
 
-/*
- * PART 3: THE RULE ENGINE (THE BRAIN)
- * 
- * This is where we decide if an event is important enough
- * to alert about. It uses simple if-then rules.
- */
+// ============================================================================
+// Alert Logic
+// ============================================================================
 
-pub struct RuleEngine {
-    // If collateral ratio drops below this, send warning
-    collateral_threshold: f64,  // Default: 1.5 (150%)
-    
-    // If transfer amount is above this, send warning  
-    transfer_threshold: f64,    // Default: 100,000
+pub struct AlertEngine {
+    threshold: f64,
 }
 
-impl RuleEngine {
-    // Create a new rule engine with settings from environment or defaults
+impl Default for AlertEngine {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl AlertEngine {
     pub fn new() -> Self {
-        // Read collateral threshold from environment or use default
-        let collateral_threshold = env::var("COLLATERAL_THRESHOLD")
-            .unwrap_or_else(|_| "1.5".to_string())  // Default to 1.5 (150%)
+        let threshold = env::var("TRANSFER_THRESHOLD")
+            .unwrap_or_else(|_| "100000.0".to_string())
             .parse()
-            .unwrap_or(1.5);  // If parsing fails, use default
+            .unwrap_or(100000.0);
 
-        // Read transfer threshold from environment or use default
-        let transfer_threshold = env::var("TRANSFER_THRESHOLD")
-            .unwrap_or_else(|_| "100000.0".to_string())  // Default to $100k
-            .parse()
-            .unwrap_or(100000.0);  // If parsing fails, use default
-
-        Self {
-            collateral_threshold,
-            transfer_threshold,
-        }
+        Self { threshold }
     }
 
-    /*
-     * THE MAIN LOGIC: Check if an event should trigger an alert
-     * 
-     * This function takes an event and applies our rules to decide
-     * if we should alert the user about it.
-     */
-    pub async fn process_event(&self, event: &Event) -> Result<Vec<Alert>> {
-        let mut alerts = Vec::new(); // Start with no alerts
-
-        // Check what type of event this is and apply appropriate rules
-        match event {
-            // RULE SET 1: Vault Update Rules
-            Event::VaultUpdate { vault_id, ratio, .. } => {
-                // Rule: If collateral ratio is too low, create alert
-                if *ratio < self.collateral_threshold {
-                    // Decide how urgent this is
-                    let severity = if *ratio < 1.2 { 
-                        "CRITICAL"  // Below 120% = very dangerous
-                    } else { 
-                        "WARNING"   // Below 150% but above 120% = risky
-                    };
-
-                    // Create the alert with appropriate severity
-                    if *ratio < 1.2 {
-                        // Below 120% = Critical (very dangerous)
-                        alerts.push(Alert::critical(
-                            format!("Low Collateralization - {}", severity),
-                            format!(
-                                "Vault {} has ratio {:.2}% (threshold: {:.2}%)",
-                                vault_id,
-                                ratio * 100.0,                    // Convert to percentage
-                                self.collateral_threshold * 100.0 // Show our threshold
-                            ),
-                        ));
-                    } else {
-                        // Between 120-150% = Warning (risky but not critical)
-                        alerts.push(Alert::warning(
-                            format!("Low Collateralization - {}", severity),
-                            format!(
-                                "Vault {} has ratio {:.2}% (threshold: {:.2}%)",
-                                vault_id,
-                                ratio * 100.0,                    // Convert to percentage
-                                self.collateral_threshold * 100.0 // Show our threshold
-                            ),
-                        ));
-                    }
-                }
-            }
-
-            // RULE SET 2: Transfer Rules  
-            Event::Transfer { from, to, amount, .. } => {
-                // Rule: If transfer amount is large, create alert
-                if *amount > self.transfer_threshold {
-                    alerts.push(Alert::warning(
-                        "Large Transfer Detected".to_string(),
-                        format!(
-                            "Transfer of {:.2} from {} to {}", 
-                            amount, from, to
-                        ),
-                    ));
-                }
-            }
-
-            // RULE SET 3: Liquidation Rules
-            Event::Liquidation { vault_id, liquidated_amount, .. } => {
-                // Rule: Any liquidation is critical (someone lost money)
-                alerts.push(Alert::critical(
-                    "Vault Liquidation".to_string(),
-                    format!(
-                        "Vault {} liquidated for {:.2}", 
-                        vault_id, liquidated_amount
-                    ),
-                ));
-            }
-        }
-
-        Ok(alerts) // Return any alerts we created
-    }
-}
-
-/*
- * PART 4: MOCK EVENT GENERATOR (FOR TESTING)
- * 
- * This creates fake events so we can test our system without
- * connecting to the real blockchain. Like a fire drill.
- */
-
-pub struct MockEventGenerator {
-    events: Vec<Event>,  // List of fake events to process
-    current: usize,      // Which event we're on
-}
-
-impl MockEventGenerator {
-    // Create a generator with some realistic test events
-    pub fn new() -> Self {
-        Self {
-            events: vec![
-                // Event 1: A vault with dangerously low collateral
-                Event::VaultUpdate {
-                    vault_id: "vault_001".to_string(),
-                    collateral: 1000.0,  // $1000 backup
-                    debt: 850.0,         // $850 borrowed
-                    ratio: 1.18,         // 118% ratio - DANGEROUS!
-                    block_number: 18500000,
-                    timestamp: Utc::now(),
-                },
-                
-                // Event 2: A large money transfer
-                Event::Transfer {
-                    from: "0x1234...".to_string(),
-                    to: "0x5678...".to_string(),
-                    amount: 250000.0,    // $250k - above our $100k threshold
-                    token: "DAI".to_string(),
-                    block_number: 18500001,
-                    timestamp: Utc::now(),
-                },
-                
-                // Event 3: Someone got liquidated (lost their money)
-                Event::Liquidation {
-                    vault_id: "vault_002".to_string(),
-                    liquidated_amount: 50000.0,  // $50k lost
-                    block_number: 18500002,
-                    timestamp: Utc::now(),
-                },
-            ],
-            current: 0,
-        }
-    }
-
-    // Get the next fake event (returns None when we're done)
-    pub async fn next_event(&mut self) -> Option<Event> {
-        if self.current < self.events.len() {
-            let event = self.events[self.current].clone();
-            self.current += 1;
-            Some(event)
+    pub fn should_alert(&self, transfer: &Transfer) -> Option<Alert> {
+        if transfer.amount > self.threshold {
+            Some(Alert::new(
+                "Large Whale Transfer Detected".to_string(),
+                format!(
+                    "${:.2} {} transferred from {} to {}",
+                    transfer.amount, transfer.token, transfer.from, transfer.to
+                ),
+            ))
         } else {
-            None // No more events
+            None
         }
     }
 }
 
-/*
- * PART 5: CONSOLE NOTIFIER (HOW WE SHOW ALERTS)
- * 
- * This takes our alerts and displays them on the screen
- * with emojis and colors so they're easy to understand.
- */
+// ============================================================================
+// Notification System
+// ============================================================================
 
 pub struct ConsoleNotifier;
+
+impl Default for ConsoleNotifier {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl ConsoleNotifier {
     pub fn new() -> Self {
         Self
     }
 
-    // Display an alert on the console with appropriate emoji
     pub async fn send(&self, alert: &Alert) -> Result<()> {
-        // Choose emoji based on how urgent the alert is
-        let emoji = match alert.severity {
-            Severity::Critical => "🚨",  // Red circle - urgent!
-            Severity::Warning => "⚠️",   // Yellow triangle - pay attention
-            Severity::Info => "ℹ️",      // Blue circle - just so you know
-        };
-
-        // Print the alert in a clear format
-        println!("{} {} - {}", emoji, alert.title, alert.message);
-        
-        // Also log it for debugging
-        info!("Alert sent: {}", alert.title);
-        
+        println!("⚠️  {} - {}", alert.title, alert.message);
+        info!("Alert sent to console: {}", alert.title);
         Ok(())
     }
 }
 
-/*
- * PART 6: MAIN PROGRAM ENTRY POINT
- * 
- * This is where the program starts. It sets up everything
- * and decides whether to run in mock mode or simulation mode.
- */
+pub struct TelegramNotifier {
+    bot_token: String,
+    chat_id: String,
+    client: reqwest::Client,
+}
+
+impl TelegramNotifier {
+    pub fn new() -> Result<Self> {
+        let bot_token = env::var("TELEGRAM_BOT_TOKEN")
+            .map_err(|_| anyhow::anyhow!("TELEGRAM_BOT_TOKEN not set"))?;
+        let chat_id = env::var("TELEGRAM_CHAT_ID")
+            .map_err(|_| anyhow::anyhow!("TELEGRAM_CHAT_ID not set"))?;
+
+        Ok(Self {
+            bot_token,
+            chat_id,
+            client: reqwest::Client::new(),
+        })
+    }
+
+    pub async fn send(&self, alert: &Alert) -> Result<()> {
+        let message = format!(
+            "⚠️ *{}*\n\n{}\n\n_Time: {}_",
+            alert.title,
+            alert.message,
+            alert.timestamp.format("%Y-%m-%d %H:%M:%S UTC")
+        );
+
+        let url = format!("https://api.telegram.org/bot{}/sendMessage", self.bot_token);
+        let payload = serde_json::json!({
+            "chat_id": self.chat_id,
+            "text": message,
+            "parse_mode": "Markdown"
+        });
+
+        let response = self.client.post(&url).json(&payload).send().await?;
+
+        if response.status().is_success() {
+            info!("Alert sent to Telegram: {}", alert.title);
+        } else {
+            let error_text = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "Unknown error".to_string());
+            warn!("Failed to send Telegram alert: {}", error_text);
+        }
+
+        Ok(())
+    }
+}
+
+pub struct Notifier {
+    console: ConsoleNotifier,
+    telegram: Option<TelegramNotifier>,
+}
+
+impl Default for Notifier {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Notifier {
+    pub fn new() -> Self {
+        let console = ConsoleNotifier::new();
+        let telegram = TelegramNotifier::new().ok();
+
+        if telegram.is_some() {
+            info!("📱 Telegram notifications enabled");
+        } else {
+            info!("📱 Telegram notifications disabled (no credentials)");
+        }
+
+        Self { console, telegram }
+    }
+
+    pub async fn send(&self, alert: &Alert) -> Result<()> {
+        self.console.send(alert).await?;
+
+        if let Some(telegram) = &self.telegram {
+            if let Err(e) = telegram.send(alert).await {
+                warn!("Telegram notification failed: {}", e);
+            }
+        }
+
+        Ok(())
+    }
+}
+
+// ============================================================================
+// Token Recognition
+// ============================================================================
+
+fn get_token_info(address: &str) -> Option<(&str, u8)> {
+    // Returns Some((symbol, decimals)) for known tokens only
+    // Returns None for unknown tokens to skip them
+    match address.to_lowercase().as_str() {
+        "0xdac17f958d2ee523a2206206994597c13d831ec7" => Some(("USDT", 6)),
+        "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48" => Some(("USDC", 6)),
+        "0x6b175474e89094c44da98b954eedeac495271d0f" => Some(("DAI", 18)),
+        "0x2260fac5e5542a773aa44fbcfedf7c193bc2c599" => Some(("WBTC", 8)),
+        "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2" => Some(("WETH", 18)),
+        "0x514910771af9ca656af840dff83e8264ecf986ca" => Some(("LINK", 18)),
+        "0x1f9840a85d5af5bf1d1762f925bdaddc4201f984" => Some(("UNI", 18)),
+        "0x7fc66500c84a76ad7e9c93437bfc5ac33e2ddae9" => Some(("AAVE", 18)),
+        _ => None, // Skip unknown tokens
+    }
+}
+
+async fn get_token_price_usd(token_address: &str, http_client: &reqwest::Client) -> Option<f64> {
+    // Fetch real-time token price from CoinGecko API (free, no API key required)
+    let url = format!(
+        "https://api.coingecko.com/api/v3/simple/token_price/ethereum?contract_addresses={token_address}&vs_currencies=usd"
+    );
+
+    match http_client.get(&url).send().await {
+        Ok(response) => {
+            if let Ok(json) = response.json::<serde_json::Value>().await {
+                // Parse response: {"0xaddress": {"usd": 1.00}}
+                json.get(token_address.to_lowercase())
+                    .and_then(|obj| obj.get("usd"))
+                    .and_then(|price| price.as_f64())
+            } else {
+                warn!("Failed to parse CoinGecko response for {}", token_address);
+                None
+            }
+        }
+        Err(e) => {
+            warn!("Failed to fetch price for {}: {}", token_address, e);
+            None
+        }
+    }
+}
+
+// ============================================================================
+// Main Monitoring Logic
+// ============================================================================
+
+fn mask_url(url: &str) -> String {
+    if let Some(scheme_end) = url.find("://") {
+        let scheme = &url[..scheme_end + 3];
+        if let Some(host_end) = url[scheme_end + 3..].find('/') {
+            let host = &url[scheme_end + 3..scheme_end + 3 + host_end];
+            return format!("{scheme}{host}/***/");
+        }
+    }
+    "***".to_string()
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Set up logging so we can see what's happening
     tracing_subscriber::fmt().init();
 
-    info!("🏗️  Starting Watchtower - Simple On-chain Intelligence Reaper");
-
-    // Check if user wants simulation mode (more realistic timing)
-    let use_simulation = env::var("SIMULATION_MODE")
-        .unwrap_or_else(|_| "false".to_string())  // Default to false
-        .parse()
-        .unwrap_or(false);
-
-    // Run in the appropriate mode
-    if use_simulation {
-        info!("🧪 Running in simulation mode");
-        run_simulation().await
-    } else {
-        info!("🧪 Running in mock mode");
-        run_mock().await
+    match dotenv::dotenv() {
+        Ok(path) => info!("📄 Loaded .env from {:?}", path),
+        Err(e) => warn!("⚠️  Could not load .env file: {}", e),
     }
-}
 
-/*
- * MOCK MODE: Process events immediately for quick testing
- * 
- * This mode processes all events quickly so you can see
- * how the system works without waiting.
- */
-async fn run_mock() -> Result<()> {
-    // Set up our components
-    let mut event_generator = MockEventGenerator::new();
-    let rule_engine = RuleEngine::new();
-    let notifier = ConsoleNotifier::new();
+    info!("🏗️  Starting Watchtower - Whale Wallet Monitor");
 
-    info!("🚀 Starting mock event monitoring...");
+    // Load configuration
+    let ws_url = env::var("WS_RPC_URL").expect("WS_RPC_URL must be set in .env");
 
-    let mut event_count = 0;
-    let mut alert_count = 0;
+    let addresses: Vec<String> = env::var("WATCH_ADDRESSES")
+        .expect("WATCH_ADDRESSES must be set in .env")
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
 
-    // Process each fake event
-    while let Some(event) = event_generator.next_event().await {
-        event_count += 1;
-        info!("📥 Processing event #{}: {:?}", event_count, event);
+    let wallet_labels_str = env::var("WALLET_LABELS").unwrap_or_default();
+    if wallet_labels_str.is_empty() {
+        warn!("⚠️  WALLET_LABELS not found - addresses will show as 'Unknown'");
+    }
 
-        // Apply our rules to see if this event should trigger alerts
-        match rule_engine.process_event(&event).await {
-            Ok(alerts) => {
-                // Send each alert we generated
-                for alert in alerts {
-                    alert_count += 1;
-                    notifier.send(&alert).await?;
+    let wallet_labels: std::collections::HashMap<String, String> = wallet_labels_str
+        .split(',')
+        .filter_map(|pair| {
+            let parts: Vec<&str> = pair.split('=').collect();
+            if parts.len() == 2 {
+                Some((parts[0].trim().to_lowercase(), parts[1].trim().to_string()))
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    info!("📋 Loaded {} wallet labels", wallet_labels.len());
+    info!("🔌 Connecting to blockchain: {}", mask_url(&ws_url));
+
+    let provider = Provider::<Ws>::connect(&ws_url).await?;
+
+    info!("👁️  Watching {} whale wallets:", addresses.len());
+    for addr in &addresses {
+        let addr_key = addr.to_lowercase();
+        let label = wallet_labels
+            .get(&addr_key)
+            .map(|l| l.as_str())
+            .unwrap_or("Unknown");
+        info!("   - {} ({})", addr, label);
+    }
+
+    let alert_engine = AlertEngine::new();
+    let notifier = Notifier::new();
+    let http_client = reqwest::Client::new(); // For fetching prices
+
+    // ERC-20 Transfer event signature: keccak256("Transfer(address,address,uint256)")
+    let transfer_sig: H256 =
+        "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef".parse()?;
+
+    // Convert addresses to H256 topics (padded with zeros on the left)
+    let address_topics: Vec<H256> = addresses
+        .iter()
+        .filter_map(|addr| {
+            addr.parse::<Address>().ok().map(|a| {
+                let mut padded = [0u8; 32];
+                padded[12..32].copy_from_slice(a.as_bytes());
+                H256::from(padded)
+            })
+        })
+        .collect();
+
+    // Subscribe to Transfer events FROM monitored addresses
+    let filter = Filter::new().topic0(transfer_sig).topic1(address_topics);
+
+    let mut stream = provider.subscribe_logs(&filter).await?;
+    info!("✅ Connected! Listening for whale token transfers (known tokens only)...");
+
+    while let Some(log) = stream.next().await {
+        let token_address = format!("{:#x}", log.address);
+        let from_addr = format!(
+            "{:#x}",
+            Address::from_slice(&log.topics[1].as_bytes()[12..])
+        );
+        let to_addr = format!(
+            "{:#x}",
+            Address::from_slice(&log.topics[2].as_bytes()[12..])
+        );
+
+        // Only process known tokens
+        if let Some((symbol, decimals)) = get_token_info(&token_address) {
+            // Decode transfer amount
+            if log.data.len() >= 32 {
+                let amount_raw = U256::from_big_endian(&log.data);
+                let divisor = 10_u64.pow(decimals as u32) as f64;
+                let amount = amount_raw.as_u128() as f64 / divisor;
+
+                // Fetch real-time USD price
+                if let Some(price_usd) = get_token_price_usd(&token_address, &http_client).await {
+                    let usd = amount * price_usd;
+
+                    let from_label = wallet_labels
+                        .get(&from_addr.to_lowercase())
+                        .map(|l| l.as_str())
+                        .unwrap_or("Unknown");
+                    let to_label = wallet_labels
+                        .get(&to_addr.to_lowercase())
+                        .map(|l| l.as_str())
+                        .unwrap_or("Unknown");
+
+                    info!(
+                        "💰 {:.2} {} @ ${:.2} = ${:.2} from {} to {}",
+                        amount, symbol, price_usd, usd, from_label, to_label
+                    );
+
+                    let transfer = Transfer {
+                        from: format!("{from_addr} [{from_label}]"),
+                        to: format!("{to_addr} [{to_label}]"),
+                        amount: usd,
+                        token: symbol.to_string(),
+                        block_number: log.block_number.map(|n| n.as_u64()).unwrap_or(0),
+                        timestamp: Utc::now(),
+                    };
+
+                    if let Some(alert) = alert_engine.should_alert(&transfer) {
+                        notifier.send(&alert).await?;
+                    }
+                } else {
+                    warn!(
+                        "⚠️  Skipping {} transfer - could not fetch real-time price",
+                        symbol
+                    );
                 }
             }
-            Err(e) => warn!("Failed to process event: {}", e),
         }
-
-        // Wait a bit between events so you can read the output
-        sleep(Duration::from_secs(2)).await;
+        // Unknown tokens are silently skipped
     }
 
-    // Show summary of what happened
-    info!("📊 Summary: {} events processed, {} alerts generated", event_count, alert_count);
-    info!("👋 Watchtower completed");
     Ok(())
 }
-
-/*
- * SIMULATION MODE: More realistic timing and behavior
- * 
- * This mode simulates how the system would work in real life,
- * with realistic delays between events.
- */
-async fn run_simulation() -> Result<()> {
-    info!("🎭 Simulation mode - creating realistic test environment");
-    
-    let simulation = SimpleSimulation::new();
-    simulation.run().await
-}
-
-/*
- * SIMPLE SIMULATION: Creates a realistic test environment
- * 
- * This simulates connecting to a blockchain and receiving
- * events with realistic timing.
- */
-pub struct SimpleSimulation {
-    events: Vec<Event>,
-}
-
-impl SimpleSimulation {
-    pub fn new() -> Self {
-        Self {
-            events: vec![
-                // Simulation Event 1: Critical vault situation
-                Event::VaultUpdate {
-                    vault_id: "sim_vault_001".to_string(),
-                    collateral: 1000.0,
-                    debt: 900.0,
-                    ratio: 1.11,  // 111% - very dangerous!
-                    block_number: 18600000,
-                    timestamp: Utc::now(),
-                },
-                
-                // Simulation Event 2: Huge money movement
-                Event::Transfer {
-                    from: "0xSimulated1234".to_string(),
-                    to: "0xSimulated5678".to_string(),
-                    amount: 500000.0,  // Half a million dollars!
-                    token: "USDC".to_string(),
-                    block_number: 18600001,
-                    timestamp: Utc::now(),
-                },
-            ],
-        }
-    }
-
-    // Run the simulation with realistic timing
-    pub async fn run(&self) -> Result<()> {
-        let rule_engine = RuleEngine::new();
-        let notifier = ConsoleNotifier::new();
-
-        // Simulate connecting to services
-        info!("🌐 Simulated blockchain connected");
-        info!("📱 Simulated notification services ready");
-
-        // Process each event with realistic delays
-        for (i, event) in self.events.iter().enumerate() {
-            info!("📡 Simulated blockchain event #{}: {:?}", i + 1, event);
-
-            // Apply our rules
-            let alerts = rule_engine.process_event(event).await?;
-            
-            // Send any alerts we generated
-            for alert in alerts {
-                info!("🚨 Alert generated in simulation");
-                notifier.send(&alert).await?;
-            }
-
-            // Wait like real blockchain timing (3 seconds between events)
-            sleep(Duration::from_secs(3)).await;
-        }
-
-        info!("✅ Simulation completed successfully");
-        Ok(())
-    }
-}
-
-/*
- * PART 7: TESTS (MAKING SURE EVERYTHING WORKS)
- * 
- * These tests verify that our rules work correctly.
- * They run automatically when you type "cargo test".
- */
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    // Test: Make sure low collateral triggers an alert
-    #[tokio::test]
-    async fn test_rule_engine() {
-        let engine = RuleEngine::new();
-        
-        // Create a test event with low collateral ratio
-        let event = Event::VaultUpdate {
-            vault_id: "test_vault".to_string(),
-            collateral: 100.0,
-            debt: 90.0,
-            ratio: 1.1,  // 110% - below our 150% threshold
-            block_number: 123,
-            timestamp: Utc::now(),
-        };
-
-        // Process the event and check we get an alert
-        let alerts = engine.process_event(&event).await.unwrap();
-        assert_eq!(alerts.len(), 1);  // Should generate exactly 1 alert
-        assert!(alerts[0].title.contains("Low Collateralization"));
-    }
-
-    // Test: Make sure large transfers trigger alerts
-    #[tokio::test]
-    async fn test_transfer_rule() {
-        let engine = RuleEngine::new();
-        
-        // Create a test event with large transfer
-        let event = Event::Transfer {
-            from: "0x123".to_string(),
-            to: "0x456".to_string(),
-            amount: 200000.0,  // $200k - above our $100k threshold
-            token: "DAI".to_string(),
-            block_number: 124,
-            timestamp: Utc::now(),
-        };
-
-        // Process the event and check we get an alert
-        let alerts = engine.process_event(&event).await.unwrap();
-        assert_eq!(alerts.len(), 1);  // Should generate exactly 1 alert
-        assert!(alerts[0].title.contains("Large Transfer"));
-    }
-
-    // Test: Make sure warning level works correctly (between 120-150%)
-    #[tokio::test]
-    async fn test_warning_level() {
-        let engine = RuleEngine::new();
-        
-        // Create a test event with ratio between 120-150% (should be warning)
-        let event = Event::VaultUpdate {
-            vault_id: "warning_vault".to_string(),
-            collateral: 100.0,
-            debt: 75.0,
-            ratio: 1.33,  // 133% - between 120% and 150%, should be WARNING
-            block_number: 125,
-            timestamp: Utc::now(),
-        };
-
-        // Process the event and check we get a warning alert
-        let alerts = engine.process_event(&event).await.unwrap();
-        assert_eq!(alerts.len(), 1);  // Should generate exactly 1 alert
-        assert!(alerts[0].title.contains("Low Collateralization"));
-        // Check that it's a warning, not critical
-        matches!(alerts[0].severity, Severity::Warning);
-    }
-
-    // Test: Make sure our mock event generator works
-    #[test]
-    fn test_mock_event_generator() {
-        let generator = MockEventGenerator::new();
-        assert_eq!(generator.events.len(), 3);  // Should have 3 test events
-    }
-}
-
-/*
- * SUMMARY OF HOW THIS ALL WORKS TOGETHER:
- * 
- * 1. Events happen on the blockchain (VaultUpdate, Transfer, Liquidation)
- * 2. Our RuleEngine checks each event against simple rules
- * 3. If a rule matches, we create an Alert with clear explanation
- * 4. The ConsoleNotifier shows the alert with emoji and description
- * 5. Users see exactly what happened and why it matters
- * 
- * The whole system is designed to be:
- * - Simple to understand (clear variable names, lots of comments)
- * - Easy to test (mock mode for quick testing, simulation for realism)
- * - Clear output (emojis, percentages, plain English explanations)
- * - Extensible (easy to add new rules or alert types)
- */
