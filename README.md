@@ -1,4 +1,4 @@
-# Watchtower - Crypto Alert System
+# Watchtower
 
 A **security guard for your crypto investments** that watches the blockchain 24/7 and alerts you when important things happen.
 
