@@ -6,6 +6,9 @@
 
 Monitors ERC-20 token transfers from whale wallets (exchanges, funds, large holders) in real-time. Fetches live prices from CoinGecko API and sends alerts only for known valuable tokens.
 
+![console output](./screenshots/console1.png)
+![alert to Telegram](./screenshots/console2.png)
+
 ## Quick Start
 
 ```bash
