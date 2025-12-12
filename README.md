@@ -1,10 +1,10 @@
 # Watchtower
 
-**Real-time whale wallet monitor** - Get instant Telegram alerts when crypto whales move large amounts of tokens with accurate, real-time USD values.
+**Real-time wallet monitor** - Get instant console or Telegram (optional) alerts when crypto whales (or not) move large amounts of tokens with accurate, real-time USD values.
 
 ## What It Does
 
-Monitors ERC-20 token transfers from whale wallets (exchanges, funds, large holders) in real-time. Fetches live prices from CoinGecko API and sends alerts only for known valuable tokens.
+Monitors ERC-20 token transfers from whale wallets (exchanges, funds, large holders) in real-time. Fetches live prices from CoinGecko API (be aware of rate limiting) and sends alerts only for known valuable tokens.
 
 ![console output](./screenshots/console1.png)
 ![alert to Telegram](./screenshots/console2.png)
@@ -25,11 +25,11 @@ nano .env  # Add your RPC URL and wallets to watch
 ### 1. Get Blockchain Access (Free)
 
 Sign up for a free RPC provider:
-- [Alchemy](https://alchemy.com) (Recommended)
+- [Alchemy](https://alchemy.com)
 - [Infura](https://infura.io)
 - [QuickNode](https://quicknode.com)
 
-Create an Ethereum Mainnet app and copy the **WebSocket URL** (starts with `wss://`).
+Copy the **WebSocket URL** for the Ethereum Mainnet (starts with `wss://`).
 
 ### 2. Configure Watchtower
 
@@ -66,7 +66,6 @@ TRANSFER_THRESHOLD=100000
 
 ## Monitored Tokens
 
-**Only known valuable tokens are monitored** (unknown tokens silently skipped):
 - **Stablecoins**: USDT, USDC, DAI
 - **Wrapped Assets**: WBTC, WETH
 - **DeFi Tokens**: LINK, UNI, AAVE
@@ -103,7 +102,7 @@ Find more on [Etherscan's Top Accounts](https://etherscan.io/accounts).
 
 ## Running 24/7
 
-### Option 1: tmux (Recommended)
+### Option 1: tmux
 ```bash
 tmux new -s watchtower
 ./run.sh
@@ -118,27 +117,13 @@ tail -f watchtower.log  # View logs
 pkill watchtower        # Stop
 ```
 
-## Project Structure
-
-```
-watchtower/
-├── src/main.rs      # Complete application (~350 lines)
-├── Cargo.toml       # Dependencies
-├── .env.example     # Configuration template
-├── .env             # Your configuration (git-ignored)
-├── run.sh           # Start script
-├── README.md        # This file
-```
-
 ## How It Works
 
 1. Connects to Ethereum via WebSocket
 2. Subscribes to ERC-20 Transfer events from monitored addresses
-3. Filters to only known valuable tokens
-4. Fetches real-time USD price from CoinGecko API
+3. Filters to only known (based on wether you want to add more hardcoded or not...) tokens
+4. Fetches real-time USD price from CoinGecko API (again, be aware of rate limits, error will be displayed in that case without panic)
 5. Sends Telegram alert if transfer exceeds threshold
-
-**Simple, accurate, efficient.**
 
 ## Troubleshooting
 
@@ -151,7 +136,7 @@ watchtower/
 - Verify API key is valid
 
 **No transfers detected**
-- Whale wallets may not be actively trading
+- Whale wallets may not be actively trading (can confirm on Etherscan, so far I have not hit any missing transfer)
 - Try lowering `TRANSFER_THRESHOLD` temporarily
 - Verify wallet addresses are correct
 
@@ -167,13 +152,11 @@ watchtower/
 
 ## Cost
 
-**$0** - Everything is free:
+**$0** question mark... - Everything is free (as of right now):
 - RPC providers offer generous free tiers
 - CoinGecko API is free (no key required)
 - Telegram is free
 - Watchtower is open source
-
-Perfect for personal whale watching.
 
 ## Adding New Tokens
 
@@ -188,5 +171,3 @@ fn get_token_info(address: &str) -> Option<(&str, u8)> {
     }
 }
 ```
-
-Real-time prices are fetched automatically from CoinGecko.
